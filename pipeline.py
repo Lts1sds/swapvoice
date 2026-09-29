@@ -1,4 +1,4 @@
-import os, sys, subprocess, asyncio, tempfile, wave, time, shutil
+import os, sys, re, subprocess, asyncio, tempfile, wave, time, shutil
 
 
 def _find_exe(name):
@@ -204,6 +204,118 @@ def pitch_mode(src, dst, factor, progress=None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _group_words(seg_list):
+    """用词级时间戳把语音分组成句级 TTS 块：真实时间戳、词边界切刀。
+    切分条件：句末标点(≥12字) / 停顿>0.4s(≥12字) / 满30字。碎片(<4字)并入前块。"""
+    MAXCH, MINCH, GAP = 30, 12, 0.4
+    words = []
+    for seg in seg_list:
+        for ws, we, w in seg[3]:
+            if w.strip():
+                words.append((ws, we, w))
+    if not words:
+        return None
+    chunks, cur, cur_text = [], [], ""
+    for w in words:
+        if cur:
+            gap = w[0] - cur[-1][1]
+            if (len(cur_text) >= MAXCH or (len(cur_text) >= MINCH and (gap > GAP or cur_text[-1] in "。！？!?；;"))):
+                chunks.append(cur)
+                cur, cur_text = [], ""
+        cur.append(w)
+        cur_text += w[2]
+    if cur:
+        chunks.append(cur)
+    merged = []
+    for ch in chunks:
+        text = "".join(x[2] for x in ch).strip()
+        if merged and len(text) < 4:
+            merged[-1].extend(ch)
+        else:
+            merged.append(ch)
+    out = []
+    for ch in merged:
+        text = "".join(x[2] for x in ch).strip()
+        if text:
+            out.append((ch[0][0], ch[-1][1], text))
+    return out or None
+
+
+def _split_one(start, end, text):
+    """单个时间窗内：按标点切句、碎片合并、超长块均分，时间戳按字符比例内插。"""
+    MAXCH = 25
+    parts = re.findall(r"[^。！？!?；;，,、]+[。！？!?；;，,、]*", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) <= 1:
+        parts = [text.strip()]
+    merged = []
+    for p in parts:
+        if merged and len(p) < 2:
+            merged[-1] += p
+        else:
+            merged.append(p)
+    pieces = []
+    for p in merged:
+        if len(p) <= MAXCH:
+            pieces.append(p)
+            continue
+        n = -(-len(p) // MAXCH)
+        step = -(-len(p) // n)
+        for j in range(0, len(p), step):
+            pieces.append(p[j : j + step])
+    pieces = [p for p in pieces if p]
+    if not pieces:
+        return []
+    total = sum(len(p) for p in pieces)
+    out = []
+    t = start
+    for p in pieces:
+        d = (end - start) * len(p) / total
+        out.append((t, t + d, p))
+        t += d
+    return out
+
+
+def _split_sentences(seg_list, sil=None):
+    """把 ASR 粗段切成句级 TTS 块。有静音锚点时按停顿区间分配文本（在标点附近落刀），
+    否则退化为纯标点切分。"""
+    sil = sorted(sil or [])
+    out = []
+    for start, end, text in seg_list:
+        anchors = [m for m in sil if start + 0.15 < m < end - 0.15]
+        if not anchors:
+            out.extend(_split_one(start, end, text))
+            continue
+        spans = []
+        prev = start
+        for m in anchors:
+            spans.append((prev, m))
+            prev = m
+        spans.append((prev, end))
+        remaining = text
+        for i, (s, e) in enumerate(spans):
+            if not remaining:
+                break
+            if i == len(spans) - 1:
+                out.extend(_split_one(s, e, remaining))
+                break
+            share = (e - s) / (end - start)
+            target = max(1, min(len(remaining) - 1, round(len(text) * share)))
+            best = None
+            for delta in range(0, 8):
+                for pos in (target + delta, target - delta):
+                    if 1 <= pos < len(remaining) and remaining[pos - 1] in "。！？!?；;，,、 ":
+                        best = pos
+                        break
+                if best:
+                    break
+            if best is None:
+                best = target
+            out.extend(_split_one(s, e, remaining[:best].strip()))
+            remaining = remaining[best:].strip()
+    return out
+
+
 def process(video, choice, progress=None, device=None):
     def emit(stage, pct, msg):
         if progress:
@@ -238,7 +350,7 @@ def process(video, choice, progress=None, device=None):
         if device == "cuda":
             emit("asr", 8, "检测到独立显卡，使用 GPU 加速识别...")
         else:
-            emit("asr", 8, "未检测到 NVIDIA 独显，使用 CPU 识别（约 1.5 倍实时速度）...")
+            emit("asr", 8, "未检测到 NVIDIA 独显，使用 CPU 批量识别（约 1.7 倍实时速度）...")
 
         from faster_whisper import WhisperModel
         try:
@@ -252,17 +364,31 @@ def process(video, choice, progress=None, device=None):
                 raise
 
         emit("asr", 10, "第二步：识别语音内容...")
-        segs, info = model.transcribe(audio_wav, vad_filter=True, beam_size=1)
-        expected = audio_dur / (6.0 if device == "cuda" else 1.4)
+        if device == "cuda":
+            segs, info = model.transcribe(audio_wav, vad_filter=True, beam_size=1, word_timestamps=True)
+        else:
+            try:
+                from faster_whisper import BatchedInferencePipeline
+                segs, info = BatchedInferencePipeline(model=model).transcribe(audio_wav, vad_filter=True, beam_size=1, batch_size=8, word_timestamps=True)
+            except ImportError:
+                segs, info = model.transcribe(audio_wav, vad_filter=True, beam_size=1, word_timestamps=True)
+        expected = audio_dur / (6.0 if device == "cuda" else 1.6)
         t0 = time.time()
         seg_list = []
         for s in segs:
             if s.text.strip():
-                seg_list.append((s.start, s.end, s.text.strip()))
+                words = [(w.start, w.end, w.word) for w in (s.words or [])]
+                seg_list.append((s.start, s.end, s.text.strip(), words))
             emit("asr", min(55, 10 + 45 * (time.time() - t0) / max(expected, 1)), f"识别中... 已识别 {len(seg_list)} 段")
         if not seg_list:
             raise RuntimeError("没有识别到语音，可能是视频里没有人说话。")
-        emit("asr", 55, f"识别完成，共 {len(seg_list)} 段语音，语言：{info.language}")
+        n_raw = len(seg_list)
+        grouped = _group_words(seg_list)
+        if grouped:
+            seg_list = grouped
+        else:
+            seg_list = _split_sentences([(a, b, c) for a, b, c, _ in seg_list], _silence_points(audio_wav))
+        emit("asr", 55, f"识别完成，共 {n_raw} 段语音（切分为 {len(seg_list)} 句），语言：{info.language}")
 
         detected = info.language
         if family == "zh" and detected in ("zh", "yue"):

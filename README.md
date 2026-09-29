@@ -29,7 +29,7 @@ The picture stays bit-identical; only the audio track is rebuilt. Because the ne
 
 ## Performance
 
-Measured on a laptop with **integrated graphics only** (pure CPU): recognition runs at **1.46x realtime** (whisper-medium, int8, VAD on) — a 30-minute video finishes in roughly 30 minutes. With an NVIDIA GPU the ASR stage is several times faster.
+Measured on a laptop with **integrated graphics only** (pure CPU): recognition runs at **~1.7x realtime** (whisper-medium, int8, VAD on, batched inference with word-level timestamps) — a 30-minute video finishes in roughly 25 minutes. With an NVIDIA GPU the ASR stage is several times faster.
 
 ## Install
 
