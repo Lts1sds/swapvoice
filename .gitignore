@@ -1,0 +1,10 @@
+models/
+__pycache__/
+*.pyc
+*.mp4
+*.mp3
+*.wav
+*.aac
+*.log
+_output/
+.DS_Store

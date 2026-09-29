@@ -1,0 +1,4 @@
+faster-whisper>=1.0
+edge-tts>=6.0
+flask>=3.0
+numpy>=1.24
