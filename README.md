@@ -24,7 +24,7 @@ The picture stays bit-identical; only the audio track is rebuilt. Because the ne
 - **Auto language matching** — detects the video's language; if it doesn't fit the chosen voice, swaps to a matching-gender voice of that language automatically (15 languages covered)
 - **GPU auto-detect** — uses CUDA when an NVIDIA GPU is present, silently falls back to CPU otherwise
 - **Two frontends** — drag-and-drop CLI, and a local web UI with upload progress, live log, built-in preview player and download
-- **2 instant pitch modes** — raise/lower pitch without re-dubbing, done in seconds
+- **2 instant pitch modes** — raise/lower pitch without re-dubbing; long videos are split at detected speech pauses and processed in parallel chunks, so a 1-hour video finishes in about a minute on CPU
 - **Completely free** — TTS runs on Microsoft's public edge-tts endpoint; ASR runs locally. No keys, no accounts.
 
 ## Performance

@@ -145,10 +145,63 @@ async def tts_all(items, voice, tmpdir, on_done=None):
             on_done()
 
 
-def pitch_mode(src, dst, factor):
+def _silence_points(src):
+    import re
+    r = subprocess.run([FFMPEG, "-i", src, "-af", "silencedetect=noise=-35dB:d=0.25", "-f", "null", "-"], capture_output=True)
+    err = r.stderr.decode("utf-8", "ignore")
+    starts = [float(m) for m in re.findall(r"silence_start: ([0-9.]+)", err)]
+    ends = [float(m) for m in re.findall(r"silence_end: ([0-9.]+)", err)]
+    return [(a + b) / 2 for a, b in zip(starts, ends) if b - a >= 0.25]
+
+
+def pitch_mode(src, dst, factor, progress=None):
+    dur = probe_duration(src)
     sr = int(run([FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate", "-of", "csv=p=0", src]).stdout.decode().strip() or 48000)
     af = f"asetrate={int(sr*factor)},aresample={sr},atempo={1/factor}"
-    run([FFMPEG, "-y", "-i", src, "-map", "0:a", "-af", af, "-c:a", "aac", "-b:a", "192k", dst])
+
+    n = max(1, min(10, int(dur // 420)))
+    splits = []
+    if n >= 2:
+        sil = _silence_points(src)
+        for i in range(1, n):
+            t = dur * i / n
+            cands = [p for p in sil if abs(p - t) < 60 and all(abs(p - q) > 30 for q in splits)]
+            if cands:
+                splits.append(min(cands, key=lambda p: abs(p - t)))
+
+    if len(splits) == 0:
+        run([FFMPEG, "-y", "-i", src, "-map", "0:v", "-map", "0:a", "-af", af, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", dst])
+        return
+
+    if progress:
+        progress("pitch", 15, f"检测到语音停顿，{len(splits)+1} 路并行加速处理...")
+    p = 1024 / sr
+    bounds = [0] + sorted(splits) + [dur]
+    tmpdir = tempfile.mkdtemp(prefix="vp_")
+    try:
+        procs = []
+        for i in range(len(bounds) - 1):
+            s = bounds[i]
+            e = dur if i == len(bounds) - 2 else bounds[i + 1] - p
+            chain = f"atrim=start={s:.4f}:end={e:.4f},{af},asetpts=PTS-STARTPTS"
+            procs.append(subprocess.Popen(
+                [FFMPEG, "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", src, "-map", "0:a", "-af", chain, "-c:a", "aac", "-b:a", "192k", os.path.join(tmpdir, f"c{i}.m4a")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        for pr in procs:
+            if pr.wait() != 0:
+                raise RuntimeError("并行变调失败")
+        lst = os.path.join(tmpdir, "list.txt")
+        with open(lst, "w", encoding="utf-8") as f:
+            for i in range(len(bounds) - 1):
+                f.write(f"file '{os.path.join(tmpdir, f'c{i}.m4a')}'\n")
+        merged = os.path.join(tmpdir, "pitch.m4a")
+        run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", merged])
+        if progress:
+            progress("pitch", 80, "正在合成视频...")
+        run([FFMPEG, "-y", "-i", src, "-i", merged, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "copy", "-shortest", dst])
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def process(video, choice, progress=None, device=None):
@@ -163,11 +216,7 @@ def process(video, choice, progress=None, device=None):
         tag = "声音变高" if choice == PITCH_UP else "声音变低"
         out = f"{base}_换声_{tag}.mp4"
         emit("pitch", 10, "正在快速变调...")
-        tmp = base + "_tmp_pitch.aac"
-        pitch_mode(video, tmp, factor)
-        emit("pitch", 70, "正在合成视频...")
-        run([FFMPEG, "-y", "-i", video, "-i", tmp, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "copy", "-shortest", out])
-        os.remove(tmp)
+        pitch_mode(video, out, factor, emit)
         emit("pitch", 100, "完成")
         return out
 
