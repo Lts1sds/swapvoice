@@ -1,4 +1,4 @@
-import os, sys, re, subprocess, asyncio, tempfile, wave, time, shutil
+import os, sys, re, json, subprocess, asyncio, tempfile, wave, time, shutil, queue, threading
 
 
 def _find_exe(name):
@@ -118,31 +118,73 @@ async def tts_one(text, voice, out_mp3):
             await asyncio.sleep(delays[attempt])
 
 
-async def tts_all(items, voice, tmpdir, on_done=None):
-    sem = asyncio.Semaphore(2)
-    failed = []
+def _avail_commit_gb():
+    """系统当前可提交内存（commit 余量，GB）。mkl_malloc 的失败就是撞这个值。"""
+    try:
+        import ctypes
 
-    async def work(i, text):
-        mp3 = os.path.join(tmpdir, f"seg{i}.mp3")
-        async with sem:
-            try:
-                await tts_one(text, voice, mp3)
-            except Exception:
-                failed.append((i, text))
-        if on_done:
-            on_done()
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
 
-    await asyncio.gather(*[work(i, t) for i, t in items])
-    if failed:
-        await asyncio.sleep(10)
-        for i, text in failed:
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return stat.ullAvailPageFile / 1e9
+    except Exception:
+        return 99.0
+
+
+def _tts_stream_worker(q, voice, tmpdir, done_counter, concurrency=2):
+    """后台线程：从队列取 (i, text) 做 TTS，收到 None 后收尾退出。自带事件循环，信号量限并发。"""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def runner():
+        sem = asyncio.Semaphore(concurrency)
+        failed = []
+        tasks = []
+        ended = False
+
+        async def work(i, text):
+            async with sem:
+                try:
+                    await tts_one(text, voice, os.path.join(tmpdir, f"seg{i}.mp3"))
+                except Exception:
+                    failed.append((i, text))
+            done_counter[0] += 1
+
+        while True:
             try:
-                await asyncio.sleep(3)
-                await tts_one(text, voice, os.path.join(tmpdir, f"seg{i}.mp3"))
-            except Exception:
-                print(f"  第 {i+1} 段最终失败，将跳过：{text[:20]}")
-        if on_done:
-            on_done()
+                item = q.get_nowait()
+            except queue.Empty:
+                tasks = [t for t in tasks if not t.done()]
+                if ended and not tasks:
+                    break
+                await asyncio.sleep(0.05)
+                continue
+            if item is None:
+                ended = True
+                continue
+            i, text = item
+            tasks.append(asyncio.ensure_future(work(i, text)))
+        if failed:
+            await asyncio.sleep(10)
+            for i, text in failed:
+                try:
+                    await asyncio.sleep(3)
+                    await tts_one(text, voice, os.path.join(tmpdir, f"seg{i}.mp3"))
+                except Exception:
+                    print(f"  第 {i+1} 段最终失败，将跳过：{text[:20]}")
+
+    try:
+        loop.run_until_complete(runner())
+    finally:
+        loop.close()
 
 
 def _silence_points(src):
@@ -276,46 +318,6 @@ def _split_one(start, end, text):
     return out
 
 
-def _split_sentences(seg_list, sil=None):
-    """把 ASR 粗段切成句级 TTS 块。有静音锚点时按停顿区间分配文本（在标点附近落刀），
-    否则退化为纯标点切分。"""
-    sil = sorted(sil or [])
-    out = []
-    for start, end, text in seg_list:
-        anchors = [m for m in sil if start + 0.15 < m < end - 0.15]
-        if not anchors:
-            out.extend(_split_one(start, end, text))
-            continue
-        spans = []
-        prev = start
-        for m in anchors:
-            spans.append((prev, m))
-            prev = m
-        spans.append((prev, end))
-        remaining = text
-        for i, (s, e) in enumerate(spans):
-            if not remaining:
-                break
-            if i == len(spans) - 1:
-                out.extend(_split_one(s, e, remaining))
-                break
-            share = (e - s) / (end - start)
-            target = max(1, min(len(remaining) - 1, round(len(text) * share)))
-            best = None
-            for delta in range(0, 8):
-                for pos in (target + delta, target - delta):
-                    if 1 <= pos < len(remaining) and remaining[pos - 1] in "。！？!?；;，,、 ":
-                        best = pos
-                        break
-                if best:
-                    break
-            if best is None:
-                best = target
-            out.extend(_split_one(s, e, remaining[:best].strip()))
-            remaining = remaining[best:].strip()
-    return out
-
-
 def process(video, choice, progress=None, device=None):
     def emit(stage, pct, msg):
         if progress:
@@ -344,85 +346,157 @@ def process(video, choice, progress=None, device=None):
         audio_dur = probe_duration(audio_wav)
 
         if device is None:
-            device, ctype = detect_device()
-        else:
-            ctype = "float16" if device == "cuda" else "int8"
+            device, _ = detect_device()
         if device == "cuda":
             emit("asr", 8, "检测到独立显卡，使用 GPU 加速识别...")
         else:
             emit("asr", 8, "未检测到 NVIDIA 独显，使用 CPU 批量识别（约 1.7 倍实时速度）...")
 
-        from faster_whisper import WhisperModel
-        try:
-            model = WhisperModel(MODEL_DIR, device=device, compute_type=ctype)
-        except Exception:
-            if device == "cuda":
-                emit("asr", 8, "GPU 加载失败（可能缺 CUDA 组件），已回退 CPU...")
-                device, ctype = "cpu", "int8"
-                model = WhisperModel(MODEL_DIR, device="cpu", compute_type="int8")
-            else:
-                raise
+        emit("asr", 10, "第二步：识别语音内容（边识别边配音）...")
+        worker_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_worker.py")
 
-        emit("asr", 10, "第二步：识别语音内容...")
-        if device == "cuda":
-            segs, info = model.transcribe(audio_wav, vad_filter=True, beam_size=1, word_timestamps=True)
-        else:
+        def attempt(dev, bs):
+            """启动识别子进程（崩溃隔离），边读 JSONL 边喂 TTS。返回句级块列表；失败抛 RuntimeError。"""
+            nonlocal voice, file_label, out
+            jsonl = os.path.join(tmpdir, "asr.jsonl")
+            if os.path.exists(jsonl):
+                os.remove(jsonl)
+            proc = subprocess.Popen(
+                [sys.executable, worker_py, "--audio", audio_wav, "--model", MODEL_DIR,
+                 "--out", jsonl, "--bs", str(bs), "--device", dev],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            f = None
+            while f is None:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"识别进程启动失败 (code {proc.returncode})")
+                try:
+                    f = open(jsonl, "r", encoding="utf-8")
+                except FileNotFoundError:
+                    time.sleep(0.2)
+
+            q = None
+            th = None
+            tts_done = [0]
+            chunks = []
+            n_raw = 0
+            error = None
+            done = False
+            lang = None
+            expected = audio_dur / (6.0 if dev == "cuda" else 1.6)
+            t0 = time.time()
             try:
-                from faster_whisper import BatchedInferencePipeline
-                segs, info = BatchedInferencePipeline(model=model).transcribe(audio_wav, vad_filter=True, beam_size=1, batch_size=8, word_timestamps=True)
-            except ImportError:
-                segs, info = model.transcribe(audio_wav, vad_filter=True, beam_size=1, word_timestamps=True)
-        expected = audio_dur / (6.0 if device == "cuda" else 1.6)
-        t0 = time.time()
-        seg_list = []
-        for s in segs:
-            if s.text.strip():
-                words = [(w.start, w.end, w.word) for w in (s.words or [])]
-                seg_list.append((s.start, s.end, s.text.strip(), words))
-            emit("asr", min(55, 10 + 45 * (time.time() - t0) / max(expected, 1)), f"识别中... 已识别 {len(seg_list)} 段")
-        if not seg_list:
-            raise RuntimeError("没有识别到语音，可能是视频里没有人说话。")
-        n_raw = len(seg_list)
-        grouped = _group_words(seg_list)
-        if grouped:
-            seg_list = grouped
+                while True:
+                    line = f.readline()
+                    if not line:
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.2)
+                        continue
+                    obj = json.loads(line)
+                    if isinstance(obj, list):
+                        start, end, text, words = obj
+                        n_raw += 1
+                        grouped = _group_words([(start, end, text, [tuple(w) for w in words])])
+                        if not grouped:
+                            grouped = _split_one(start, end, text)
+                        if q is not None:
+                            for a, b, txt in grouped:
+                                chunks.append((a, b, txt))
+                                q.put((len(chunks) - 1, txt))
+                        emit("asr", min(88, 10 + 78 * (time.time() - t0) / max(expected, 1)),
+                             f"识别+配音中... 已切分 {len(chunks)} 句，已配音 {tts_done[0]}")
+                    elif "lang" in obj:
+                        lang = obj["lang"]
+                        prob = obj.get("prob") or 0
+                        if prob > 0.6:
+                            if family == "zh" and lang in ("zh", "yue"):
+                                pass
+                            elif family == lang:
+                                pass
+                            elif lang in LANG_DEFAULTS:
+                                new_voice = LANG_DEFAULTS[lang][0 if gender == "f" else 1]
+                                emit("asr", 12, f"检测到视频语言与所选音色不匹配，已自动切换音色：{short_name(new_voice)}")
+                                voice, file_label = new_voice, short_name(new_voice)
+                                out = f"{base}_换声_{file_label}.mp4"
+                            else:
+                                emit("asr", 12, f"警告：检测到语言 {lang}，所选音色可能不适用，效果可能不佳")
+                        q = queue.Queue()
+                        th = threading.Thread(target=_tts_stream_worker, args=(q, voice, tmpdir, tts_done), daemon=True)
+                        th.start()
+                    elif "error" in obj:
+                        error = obj["error"]
+                        break
+                    elif obj.get("done"):
+                        done = True
+                        break
+                f.close()
+                if th is not None:
+                    q.put(None)
+                    th.join()
+                if error is not None:
+                    raise RuntimeError(error)
+                if not done:
+                    raise RuntimeError(f"识别进程异常退出 (code {proc.poll()})")
+                if not chunks:
+                    raise RuntimeError("没有识别到语音，可能是视频里没有人说话。")
+                emit("tts", 90, f"识别完成：{n_raw} 段语音切分为 {len(chunks)} 句，配音 {tts_done[0]}/{len(chunks)}，语言：{lang}")
+                return chunks
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        proc.kill()
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                if th is not None and th.is_alive():
+                    q.put(None)
+                    th.join(timeout=120)
+
+        free_gb = _avail_commit_gb()
+        if free_gb > 7.5:
+            cpu_chain = [8, 4, 2, 0]
+        elif free_gb > 6.4:
+            cpu_chain = [4, 2, 0]
+        elif free_gb > 5.4:
+            cpu_chain = [2, 0]
         else:
-            seg_list = _split_sentences([(a, b, c) for a, b, c, _ in seg_list], _silence_points(audio_wav))
-        emit("asr", 55, f"识别完成，共 {n_raw} 段语音（切分为 {len(seg_list)} 句），语言：{info.language}")
-
-        detected = info.language
-        if family == "zh" and detected in ("zh", "yue"):
-            pass
-        elif family == detected:
-            pass
-        elif detected in LANG_DEFAULTS:
-            new_voice = LANG_DEFAULTS[detected][0 if gender == "f" else 1]
-            emit("tts", 55, f"检测到视频语言与所选音色不匹配，已自动切换音色：{short_name(new_voice)}")
-            voice, file_label = new_voice, short_name(new_voice)
-            out = f"{base}_换声_{file_label}.mp4"
-        else:
-            emit("tts", 55, f"警告：检测到语言 {detected}，所选音色可能不适用，效果可能不佳")
-
-        emit("tts", 56, f"第三步：用新声音重新配音（{len(seg_list)} 段）...")
-
-        def on_done():
-            done_count[0] += 1
-            emit("tts", 56 + 34 * done_count[0] / len(seg_list), f"配音中... {done_count[0]}/{len(seg_list)}")
-
-        done_count = [0]
-        asyncio.run(tts_all([(i, seg_list[i][2]) for i in range(len(seg_list))], voice, tmpdir, on_done))
+            cpu_chain = [0]
+        plans = ([("cuda", 0)] if device == "cuda" else []) + [("cpu", b) for b in cpu_chain]
+        seg_list = None
+        last_err = None
+        for k, (dev, bs) in enumerate(plans):
+            try:
+                seg_list = attempt(dev, bs)
+                break
+            except RuntimeError as e:
+                if "没有识别到语音" in str(e):
+                    raise
+                last_err = e
+                for fn in os.listdir(tmpdir):
+                    if fn.startswith("seg") and fn.endswith(".mp3"):
+                        os.remove(os.path.join(tmpdir, fn))
+                if k < len(plans) - 1:
+                    emit("asr", 12, f"识别遇到问题（{str(e)[:40]}），自动降级重试...")
+        if seg_list is None:
+            if last_err is not None and "alloc" in str(last_err).lower():
+                raise RuntimeError("内存不足：识别引擎无法分配内存，请关闭其他程序后重试") from last_err
+            raise RuntimeError(f"识别失败：{last_err}")
 
         import numpy as np
         emit("align", 91, "第四步：对齐时间轴...")
         dur = probe_duration(video)
         total = int(dur * SR) + SR
         track = np.zeros(total, dtype=np.int16)
-        cursor = 0
-        for i, (start, end, text) in enumerate(seg_list):
+
+        def prep(i):
+            start, end, _ = seg_list[i]
             mp3 = os.path.join(tmpdir, f"seg{i}.mp3")
             if not os.path.isfile(mp3):
-                emit("align", 91, f"第 {i+1} 段配音失败，跳过：{text[:20]}")
-                continue
+                return
             wav1 = os.path.join(tmpdir, f"s{i}.wav")
             run([FFMPEG, "-y", "-i", mp3, "-ac", "1", "-ar", str(SR), "-f", "wav", wav1])
             pcm = read_wav(wav1)
@@ -431,9 +505,23 @@ def process(video, choice, progress=None, device=None):
                 tempo = min(len(pcm) / (slot * SR), 1.45)
                 wav2 = os.path.join(tmpdir, f"f{i}.wav")
                 run([FFMPEG, "-y", "-i", wav1, "-af", f"atempo={tempo:.4f}", "-f", "wav", wav2])
-                pcm = read_wav(wav2)
-                if len(pcm) > slot * SR:
-                    pcm = pcm[: int(slot * SR)]
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(4) as ex:
+            list(ex.map(prep, range(len(seg_list))))
+
+        cursor = 0
+        for i, (start, end, text) in enumerate(seg_list):
+            wav1 = os.path.join(tmpdir, f"s{i}.wav")
+            wav2 = os.path.join(tmpdir, f"f{i}.wav")
+            src = wav2 if os.path.isfile(wav2) else (wav1 if os.path.isfile(wav1) else None)
+            if src is None:
+                emit("align", 91, f"第 {i+1} 段配音失败，跳过：{text[:20]}")
+                continue
+            pcm = read_wav(src)
+            slot = max(0.2, end - start)
+            if len(pcm) > slot * SR:
+                pcm = pcm[: int(slot * SR)]
             pos = max(int(start * SR), cursor)
             endpos = min(pos + len(pcm), total)
             track[pos:endpos] = pcm[: endpos - pos]
